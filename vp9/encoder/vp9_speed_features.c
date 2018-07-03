@@ -61,6 +61,11 @@ static void set_good_speed_feature_framesize_dependent(VP9_COMP *cpi,
                                                        SPEED_FEATURES *sf,
                                                        int speed) {
   VP9_COMMON *const cm = &cpi->common;
+  const int min_frame_size = VPXMIN(cm->width, cm->height);
+  const int is_480p_or_larger = min_frame_size >= 480;
+  const int is_720p_or_larger = min_frame_size >= 720;
+  const int is_1080p_or_larger = min_frame_size >= 1080;
+  const int is_2160p_or_larger = min_frame_size >= 2160;
 
   // speed 0 features
   sf->partition_search_breakout_thr.dist = (1 << 20);
@@ -68,25 +73,42 @@ static void set_good_speed_feature_framesize_dependent(VP9_COMP *cpi,
 
   // Currently, the machine-learning based partition search early termination
   // is only used while VPXMIN(cm->width, cm->height) >= 480 and speed = 0.
-  if (VPXMIN(cm->width, cm->height) >= 480) {
+  if (is_480p_or_larger) {
     sf->ml_partition_search_early_termination = 1;
+  }
+
+  if (!is_1080p_or_larger) {
+    sf->use_ml_partition_search_breakout = 1;
+    if (is_720p_or_larger) {
+      sf->ml_partition_search_breakout_thresh[0] = 0.0f;
+      sf->ml_partition_search_breakout_thresh[1] = 0.0f;
+      sf->ml_partition_search_breakout_thresh[2] = 0.0f;
+    } else {
+      sf->ml_partition_search_breakout_thresh[0] = 2.5f;
+      sf->ml_partition_search_breakout_thresh[1] = 1.5f;
+      sf->ml_partition_search_breakout_thresh[2] = 1.5f;
+    }
   }
 
   if (speed >= 1) {
     sf->ml_partition_search_early_termination = 0;
 
-    if (VPXMIN(cm->width, cm->height) >= 720) {
+    if (is_720p_or_larger) {
       sf->disable_split_mask =
           cm->show_frame ? DISABLE_ALL_SPLIT : DISABLE_ALL_INTER_SPLIT;
       sf->partition_search_breakout_thr.dist = (1 << 23);
+      sf->use_ml_partition_search_breakout = 0;
     } else {
       sf->disable_split_mask = DISABLE_COMPOUND_SPLIT;
       sf->partition_search_breakout_thr.dist = (1 << 21);
+      sf->ml_partition_search_breakout_thresh[0] = 0.0f;
+      sf->ml_partition_search_breakout_thresh[1] = 0.0f;
+      sf->ml_partition_search_breakout_thresh[2] = 0.0f;
     }
   }
 
   if (speed >= 2) {
-    if (VPXMIN(cm->width, cm->height) >= 720) {
+    if (is_720p_or_larger) {
       sf->disable_split_mask =
           cm->show_frame ? DISABLE_ALL_SPLIT : DISABLE_ALL_INTER_SPLIT;
       sf->adaptive_pred_interp_filter = 0;
@@ -96,11 +118,14 @@ static void set_good_speed_feature_framesize_dependent(VP9_COMP *cpi,
       sf->disable_split_mask = LAST_AND_INTRA_SPLIT_ONLY;
       sf->partition_search_breakout_thr.dist = (1 << 22);
       sf->partition_search_breakout_thr.rate = 100;
+      sf->ml_partition_search_breakout_thresh[0] = 0.0f;
+      sf->ml_partition_search_breakout_thresh[1] = -1.0f;
+      sf->ml_partition_search_breakout_thresh[2] = -4.0f;
     }
     sf->rd_auto_partition_min_limit = set_partition_min_limit(cm);
 
     // Use a set of speed features for 4k videos.
-    if (VPXMIN(cm->width, cm->height) >= 2160) {
+    if (is_2160p_or_larger) {
       sf->use_square_partition_only = 1;
       sf->intra_y_mode_mask[TX_32X32] = INTRA_DC;
       sf->intra_uv_mode_mask[TX_32X32] = INTRA_DC;
@@ -112,7 +137,8 @@ static void set_good_speed_feature_framesize_dependent(VP9_COMP *cpi,
   }
 
   if (speed >= 3) {
-    if (VPXMIN(cm->width, cm->height) >= 720) {
+    sf->use_ml_partition_search_breakout = 0;
+    if (is_720p_or_larger) {
       sf->disable_split_mask = DISABLE_ALL_SPLIT;
       sf->schedule_mode_search = cm->base_qindex < 220 ? 1 : 0;
       sf->partition_search_breakout_thr.dist = (1 << 25);
@@ -137,7 +163,7 @@ static void set_good_speed_feature_framesize_dependent(VP9_COMP *cpi,
 
   if (speed >= 4) {
     sf->partition_search_breakout_thr.rate = 300;
-    if (VPXMIN(cm->width, cm->height) >= 720) {
+    if (is_720p_or_larger) {
       sf->partition_search_breakout_thr.dist = (1 << 26);
     } else {
       sf->partition_search_breakout_thr.dist = (1 << 24);
@@ -720,6 +746,7 @@ void vp9_set_speed_features_framesize_dependent(VP9_COMP *cpi) {
   sf->partition_search_breakout_thr.dist = (1 << 19);
   sf->partition_search_breakout_thr.rate = 80;
   sf->ml_partition_search_early_termination = 0;
+  sf->use_ml_partition_search_breakout = 0;
 
   if (oxcf->mode == REALTIME) {
     set_rt_speed_feature_framesize_dependent(cpi, sf, oxcf->speed);

@@ -583,7 +583,7 @@ if (vpx_config("CONFIG_VP9_HIGHBITDEPTH") eq "yes") {
   specialize qw/vpx_fdct32x32 neon sse2 avx2 msa/;
 
   add_proto qw/void vpx_fdct32x32_rd/, "const int16_t *input, tran_low_t *output, int stride";
-  specialize qw/vpx_fdct32x32_rd sse2 avx2 neon msa/;
+  specialize qw/vpx_fdct32x32_rd sse2 avx2 neon msa vsx/;
 
   add_proto qw/void vpx_fdct32x32_1/, "const int16_t *input, tran_low_t *output, int stride";
   specialize qw/vpx_fdct32x32_1 sse2 neon msa/;
@@ -985,7 +985,11 @@ if (vpx_config("CONFIG_VP9_HIGHBITDEPTH") eq "yes") {
   # Avg
   #
   add_proto qw/unsigned int vpx_highbd_avg_8x8/, "const uint8_t *, int p";
+  specialize qw/vpx_highbd_avg_8x8 sse2/;
+
   add_proto qw/unsigned int vpx_highbd_avg_4x4/, "const uint8_t *, int p";
+  specialize qw/vpx_highbd_avg_4x4 sse2/;
+
   add_proto qw/void vpx_highbd_minmax_8x8/, "const uint8_t *s, int p, const uint8_t *d, int dp, int *min, int *max";
 
   add_proto qw/unsigned int vpx_highbd_sad64x64_avg/, "const uint8_t *src_ptr, int src_stride, const uint8_t *ref_ptr, int ref_stride, const uint8_t *second_pred";

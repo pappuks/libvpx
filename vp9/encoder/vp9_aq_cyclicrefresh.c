@@ -427,10 +427,11 @@ void vp9_cyclic_refresh_update_parameters(VP9_COMP *const cpi) {
   double weight_segment_target = 0;
   double weight_segment = 0;
   int thresh_low_motion = (cm->width < 720) ? 55 : 20;
+  int qp_thresh = VPXMIN(20, rc->best_quality << 1);
   cr->apply_cyclic_refresh = 1;
-  // TODO(jianj): Look into issue of cyclic refresh with high bitdepth.
-  if (cm->bit_depth > 8 || cm->frame_type == KEY_FRAME ||
-      cpi->svc.temporal_layer_id > 0 ||
+  if (cm->frame_type == KEY_FRAME || cpi->svc.temporal_layer_id > 0 ||
+      is_lossless_requested(&cpi->oxcf) ||
+      rc->avg_frame_qindex[INTER_FRAME] < qp_thresh ||
       (cpi->use_svc &&
        cpi->svc.layer_context[cpi->svc.temporal_layer_id].is_key_frame) ||
       (!cpi->use_svc && rc->avg_frame_low_motion < thresh_low_motion &&
@@ -502,6 +503,14 @@ void vp9_cyclic_refresh_update_parameters(VP9_COMP *const cpi) {
                    num8x8bl;
   if (weight_segment_target < 7 * weight_segment / 8)
     weight_segment = weight_segment_target;
+  // For screen-content: don't include target for the weight segment, since
+  // all for all flat areas the segment is reset, so its more accurate to
+  // just use the previous actual number of seg blocks for the weight.
+  if (cpi->oxcf.content == VP9E_CONTENT_SCREEN)
+    weight_segment =
+        (double)((cr->actual_num_seg1_blocks + cr->actual_num_seg2_blocks) >>
+                 1) /
+        num8x8bl;
   cr->weight_segment = weight_segment;
 }
 
@@ -592,7 +601,8 @@ void vp9_cyclic_refresh_reset_resize(VP9_COMP *const cpi) {
   const VP9_COMMON *const cm = &cpi->common;
   CYCLIC_REFRESH *const cr = cpi->cyclic_refresh;
   memset(cr->map, 0, cm->mi_rows * cm->mi_cols);
-  memset(cr->last_coded_q_map, MAXQ, cm->mi_rows * cm->mi_cols);
+  memset(cr->last_coded_q_map, MAXQ,
+         cm->mi_rows * cm->mi_cols * sizeof(*cr->last_coded_q_map));
   cr->sb_index = 0;
   cpi->refresh_golden_frame = 1;
   cpi->refresh_alt_ref_frame = 1;

@@ -378,7 +378,8 @@ static void fill_variance(uint32_t s2, int32_t s, int c, var *v) {
 static void get_variance(var *v) {
   v->variance =
       (int)(256 * (v->sum_square_error -
-                   ((v->sum_error * v->sum_error) >> v->log2_count)) >>
+                   (uint32_t)(((int64_t)v->sum_error * v->sum_error) >>
+                              v->log2_count)) >>
             v->log2_count);
 }
 
@@ -591,6 +592,11 @@ void vp9_set_variance_partition_thresholds(VP9_COMP *cpi, int q,
         cpi->vbp_threshold_copy = (cpi->y_dequant[q][1] << 3) > 8000
                                       ? (cpi->y_dequant[q][1] << 3)
                                       : 8000;
+      if (cpi->rc.high_source_sad ||
+          (cpi->use_svc && cpi->svc.high_source_sad_superframe)) {
+        cpi->vbp_threshold_sad = 0;
+        cpi->vbp_threshold_copy = 0;
+      }
     }
     cpi->vbp_threshold_minmax = 15 + (q >> 3);
   }
@@ -1177,6 +1183,7 @@ static uint64_t avg_source_sad(VP9_COMP *cpi, MACROBLOCK *x, int shift,
       cpi->content_state_sb_fd[sb_offset] = 0;
     }
   }
+  if (tmp_sad == 0) x->zero_temp_sad_source = 1;
   return tmp_sad;
 }
 
@@ -1212,6 +1219,9 @@ static int choose_partitioning(VP9_COMP *cpi, const TileInfo *const tile,
   int pixels_wide = 64, pixels_high = 64;
   int64_t thresholds[4] = { cpi->vbp_thresholds[0], cpi->vbp_thresholds[1],
                             cpi->vbp_thresholds[2], cpi->vbp_thresholds[3] };
+  int scene_change_detected =
+      cpi->rc.high_source_sad ||
+      (cpi->use_svc && cpi->svc.high_source_sad_superframe);
 
   // For the variance computation under SVC mode, we treat the frame as key if
   // the reference (base layer frame) is key frame (i.e., is_key_frame == 1).
@@ -1273,6 +1283,7 @@ static int choose_partitioning(VP9_COMP *cpi, const TileInfo *const tile,
     }
     // If source_sad is low copy the partition without computing the y_sad.
     if (x->skip_low_source_sad && cpi->sf.copy_partition_flag &&
+        !scene_change_detected &&
         copy_partitioning(cpi, x, xd, mi_row, mi_col, segment_id, sb_offset)) {
       x->sb_use_mv_part = 1;
       if (cpi->sf.svc_use_lowres_part &&
@@ -1301,7 +1312,7 @@ static int choose_partitioning(VP9_COMP *cpi, const TileInfo *const tile,
 
   // Index for force_split: 0 for 64x64, 1-4 for 32x32 blocks,
   // 5-20 for the 16x16 blocks.
-  force_split[0] = 0;
+  force_split[0] = scene_change_detected;
 
   if (!is_key_frame) {
     // In the case of spatial/temporal scalable coding, the assumption here is
@@ -1902,13 +1913,22 @@ static void rd_pick_sb_modes(VP9_COMP *cpi, TileDataEnc *tile_data,
   }
 
   if (aq_mode == VARIANCE_AQ) {
-    const int energy =
-        bsize <= BLOCK_16X16 ? x->mb_energy : vp9_block_energy(cpi, x, bsize);
-
     if (cm->frame_type == KEY_FRAME || cpi->refresh_alt_ref_frame ||
         cpi->force_update_segmentation ||
         (cpi->refresh_golden_frame && !cpi->rc.is_src_frame_alt_ref)) {
-      mi->segment_id = vp9_vaq_segment_id(energy);
+      int min_energy;
+      int max_energy;
+
+      // Get sub block energy range
+      if (bsize >= BLOCK_32X32) {
+        vp9_get_sub_block_energy(cpi, x, mi_row, mi_col, bsize, &min_energy,
+                                 &max_energy);
+      } else {
+        min_energy = bsize <= BLOCK_16X16 ? x->mb_energy
+                                          : vp9_block_energy(cpi, x, bsize);
+      }
+
+      mi->segment_id = vp9_vaq_segment_id(min_energy);
     } else {
       const uint8_t *const map =
           cm->seg.update_map ? cpi->segmentation_map : cm->last_frame_seg_map;
@@ -1940,6 +1960,8 @@ static void rd_pick_sb_modes(VP9_COMP *cpi, TileDataEnc *tile_data,
       x->rdmult = vp9_cyclic_refresh_get_rdmult(cpi->cyclic_refresh);
   }
 
+  if (cpi->sf.enable_tpl_model) x->rdmult = x->cb_rdmult;
+
   // Find best coding mode & reconstruct the MB so it is available
   // as a predictor for MBs that follow in the SB
   if (frame_is_intra_only(cm)) {
@@ -1966,11 +1988,14 @@ static void rd_pick_sb_modes(VP9_COMP *cpi, TileDataEnc *tile_data,
     vp9_caq_select_segment(cpi, x, bsize, mi_row, mi_col, rd_cost->rate);
   }
 
-  x->rdmult = orig_rdmult;
-
   // TODO(jingning) The rate-distortion optimization flow needs to be
   // refactored to provide proper exit/return handle.
-  if (rd_cost->rate == INT_MAX) rd_cost->rdcost = INT64_MAX;
+  if (rd_cost->rate == INT_MAX)
+    rd_cost->rdcost = INT64_MAX;
+  else
+    rd_cost->rdcost = RDCOST(x->rdmult, x->rddiv, rd_cost->rate, rd_cost->dist);
+
+  x->rdmult = orig_rdmult;
 
   ctx->rate = rd_cost->rate;
   ctx->dist = rd_cost->dist;
@@ -2097,6 +2122,7 @@ static void encode_b(VP9_COMP *cpi, const TileInfo *const tile, ThreadData *td,
                      PICK_MODE_CONTEXT *ctx) {
   MACROBLOCK *const x = &td->mb;
   set_offsets(cpi, tile, x, mi_row, mi_col, bsize);
+  if (cpi->sf.enable_tpl_model) x->rdmult = x->cb_rdmult;
   update_state(cpi, td, ctx, mi_row, mi_col, bsize, output_enabled);
   encode_superblock(cpi, td, tp, output_enabled, mi_row, mi_col, bsize, ctx);
 
@@ -2428,7 +2454,7 @@ static void update_state_rt(VP9_COMP *cpi, ThreadData *td,
   }
 
   x->skip = ctx->skip;
-  x->skip_txfm[0] = mi->segment_id ? 0 : ctx->skip_txfm[0];
+  x->skip_txfm[0] = (mi->segment_id || xd->lossless) ? 0 : ctx->skip_txfm[0];
 }
 
 static void encode_b_rt(VP9_COMP *cpi, ThreadData *td,
@@ -3315,6 +3341,320 @@ static int ml_pruning_partition(VP9_COMMON *const cm, MACROBLOCKD *const xd,
   return 0;
 }
 
+#define FEATURES 4
+#define Q_CTX 3
+#define RESOLUTION_CTX 2
+static const float partition_breakout_weights_64[RESOLUTION_CTX][Q_CTX]
+                                                [FEATURES + 1] = {
+                                                  {
+                                                      {
+                                                          -0.016673f,
+                                                          -0.001025f,
+                                                          -0.000032f,
+                                                          0.000833f,
+                                                          1.94261885f - 2.1f,
+                                                      },
+                                                      {
+                                                          -0.160867f,
+                                                          -0.002101f,
+                                                          0.000011f,
+                                                          0.002448f,
+                                                          1.65738142f - 2.5f,
+                                                      },
+                                                      {
+                                                          -0.628934f,
+                                                          -0.011459f,
+                                                          -0.000009f,
+                                                          0.013833f,
+                                                          1.47982645f - 1.6f,
+                                                      },
+                                                  },
+                                                  {
+                                                      {
+                                                          -0.064309f,
+                                                          -0.006121f,
+                                                          0.000232f,
+                                                          0.005778f,
+                                                          0.7989465f - 5.0f,
+                                                      },
+                                                      {
+                                                          -0.314957f,
+                                                          -0.009346f,
+                                                          -0.000225f,
+                                                          0.010072f,
+                                                          2.80695581f - 5.5f,
+                                                      },
+                                                      {
+                                                          -0.635535f,
+                                                          -0.015135f,
+                                                          0.000091f,
+                                                          0.015247f,
+                                                          2.90381241f - 5.0f,
+                                                      },
+                                                  },
+                                                };
+
+static const float partition_breakout_weights_32[RESOLUTION_CTX][Q_CTX]
+                                                [FEATURES + 1] = {
+                                                  {
+                                                      {
+                                                          -0.010554f,
+                                                          -0.003081f,
+                                                          -0.000134f,
+                                                          0.004491f,
+                                                          1.68445992f - 3.5f,
+                                                      },
+                                                      {
+                                                          -0.051489f,
+                                                          -0.007609f,
+                                                          0.000016f,
+                                                          0.009792f,
+                                                          1.28089404f - 2.5f,
+                                                      },
+                                                      {
+                                                          -0.163097f,
+                                                          -0.013081f,
+                                                          0.000022f,
+                                                          0.019006f,
+                                                          1.36129403f - 3.2f,
+                                                      },
+                                                  },
+                                                  {
+                                                      {
+                                                          -0.024629f,
+                                                          -0.006492f,
+                                                          -0.000254f,
+                                                          0.004895f,
+                                                          1.27919173f - 4.5f,
+                                                      },
+                                                      {
+                                                          -0.083936f,
+                                                          -0.009827f,
+                                                          -0.000200f,
+                                                          0.010399f,
+                                                          2.73731065f - 4.5f,
+                                                      },
+                                                      {
+                                                          -0.279052f,
+                                                          -0.013334f,
+                                                          0.000289f,
+                                                          0.023203f,
+                                                          2.43595719f - 3.5f,
+                                                      },
+                                                  },
+                                                };
+
+static const float partition_breakout_weights_16[RESOLUTION_CTX][Q_CTX]
+                                                [FEATURES + 1] = {
+                                                  {
+                                                      {
+                                                          -0.013154f,
+                                                          -0.002404f,
+                                                          -0.000977f,
+                                                          0.008450f,
+                                                          2.57404566f - 5.5f,
+                                                      },
+                                                      {
+                                                          -0.019146f,
+                                                          -0.004018f,
+                                                          0.000064f,
+                                                          0.008187f,
+                                                          2.15043926f - 2.5f,
+                                                      },
+                                                      {
+                                                          -0.075755f,
+                                                          -0.010858f,
+                                                          0.000030f,
+                                                          0.024505f,
+                                                          2.06848121f - 2.5f,
+                                                      },
+                                                  },
+                                                  {
+                                                      {
+                                                          -0.007636f,
+                                                          -0.002751f,
+                                                          -0.000682f,
+                                                          0.005968f,
+                                                          0.19225763f - 4.5f,
+                                                      },
+                                                      {
+                                                          -0.047306f,
+                                                          -0.009113f,
+                                                          -0.000518f,
+                                                          0.016007f,
+                                                          2.61068869f - 4.0f,
+                                                      },
+                                                      {
+                                                          -0.069336f,
+                                                          -0.010448f,
+                                                          -0.001120f,
+                                                          0.023083f,
+                                                          1.47591054f - 5.5f,
+                                                      },
+                                                  },
+                                                };
+
+static const float partition_breakout_weights_8[RESOLUTION_CTX][Q_CTX]
+                                               [FEATURES + 1] = {
+                                                 {
+                                                     {
+                                                         -0.011807f,
+                                                         -0.009873f,
+                                                         -0.000931f,
+                                                         0.034768f,
+                                                         1.32254851f - 2.0f,
+                                                     },
+                                                     {
+                                                         -0.003861f,
+                                                         -0.002701f,
+                                                         0.000100f,
+                                                         0.013876f,
+                                                         1.96755111f - 1.5f,
+                                                     },
+                                                     {
+                                                         -0.013522f,
+                                                         -0.008677f,
+                                                         -0.000562f,
+                                                         0.034468f,
+                                                         1.53440356f - 1.5f,
+                                                     },
+                                                 },
+                                                 {
+                                                     {
+                                                         -0.003221f,
+                                                         -0.002125f,
+                                                         0.000993f,
+                                                         0.012768f,
+                                                         0.03541421f - 2.0f,
+                                                     },
+                                                     {
+                                                         -0.006069f,
+                                                         -0.007335f,
+                                                         0.000229f,
+                                                         0.026104f,
+                                                         0.17135315f - 1.5f,
+                                                     },
+                                                     {
+                                                         -0.039894f,
+                                                         -0.011419f,
+                                                         0.000070f,
+                                                         0.061817f,
+                                                         0.6739977f - 1.5f,
+                                                     },
+                                                 },
+                                               };
+
+// ML-based partition search breakout.
+static int ml_predict_breakout(const VP9_COMP *const cpi, BLOCK_SIZE bsize,
+                               const MACROBLOCK *const x,
+                               const RD_COST *const rd_cost) {
+  DECLARE_ALIGNED(16, static const uint8_t, vp9_64_zeros[64]) = { 0 };
+  const VP9_COMMON *const cm = &cpi->common;
+  float features[FEATURES];
+  const float *linear_weights = NULL;  // Linear model weights.
+  float linear_score = 0.0f;
+  const int qindex = cm->base_qindex;
+  const int q_ctx = qindex >= 200 ? 0 : (qindex >= 150 ? 1 : 2);
+  const int is_720p_or_larger = VPXMIN(cm->width, cm->height) >= 720;
+  const int resolution_ctx = is_720p_or_larger ? 1 : 0;
+
+  switch (bsize) {
+    case BLOCK_64X64:
+      linear_weights = partition_breakout_weights_64[resolution_ctx][q_ctx];
+      break;
+    case BLOCK_32X32:
+      linear_weights = partition_breakout_weights_32[resolution_ctx][q_ctx];
+      break;
+    case BLOCK_16X16:
+      linear_weights = partition_breakout_weights_16[resolution_ctx][q_ctx];
+      break;
+    case BLOCK_8X8:
+      linear_weights = partition_breakout_weights_8[resolution_ctx][q_ctx];
+      break;
+    default: assert(0 && "Unexpected block size."); return 0;
+  }
+  if (!linear_weights) return 0;
+
+  {  // Generate feature values.
+    const int ac_q = vp9_ac_quant(qindex, 0, cm->bit_depth);
+    const int num_pels_log2 = num_pels_log2_lookup[bsize];
+    int feature_index = 0;
+    unsigned int var, sse;
+    float rate_f, dist_f;
+
+    var = cpi->fn_ptr[bsize].vf(x->plane[0].src.buf, x->plane[0].src.stride,
+                                vp9_64_zeros, 0, &sse);
+    var = var >> num_pels_log2;
+
+    vpx_clear_system_state();
+
+    rate_f = (float)VPXMIN(rd_cost->rate, INT_MAX);
+    dist_f = (float)(VPXMIN(rd_cost->dist, INT_MAX) >> num_pels_log2);
+    rate_f =
+        ((float)x->rdmult / 128.0f / 512.0f / (float)(1 << num_pels_log2)) *
+        rate_f;
+
+    features[feature_index++] = rate_f;
+    features[feature_index++] = dist_f;
+    features[feature_index++] = (float)var;
+    features[feature_index++] = (float)ac_q;
+    assert(feature_index == FEATURES);
+  }
+
+  {  // Calculate the output score.
+    int i;
+    linear_score = linear_weights[FEATURES];
+    for (i = 0; i < FEATURES; ++i)
+      linear_score += linear_weights[i] * features[i];
+  }
+
+  return linear_score >= cpi->sf.ml_partition_search_breakout_thresh[q_ctx];
+}
+#undef FEATURES
+#undef Q_CTX
+#undef RESOLUTION_CTX
+
+int get_rdmult_delta(VP9_COMP *cpi, BLOCK_SIZE bsize, int mi_row, int mi_col,
+                     int orig_rdmult) {
+  TplDepFrame *tpl_frame = &cpi->tpl_stats[cpi->twopass.gf_group.index];
+  TplDepStats *tpl_stats = tpl_frame->tpl_stats_ptr;
+  int tpl_stride = tpl_frame->stride;
+  int64_t intra_cost = 0;
+  int64_t mc_dep_cost = 0;
+  int mi_wide = num_8x8_blocks_wide_lookup[bsize];
+  int mi_high = num_8x8_blocks_high_lookup[bsize];
+  int row, col;
+
+  int dr = 0;
+  int count = 0;
+  double r0, rk, beta;
+
+  r0 = cpi->rd.r0;
+
+  for (row = mi_row; row < mi_row + mi_high; ++row) {
+    for (col = mi_col; col < mi_col + mi_wide; ++col) {
+      TplDepStats *this_stats = &tpl_stats[row * tpl_stride + col];
+
+      if (row >= cpi->common.mi_rows || col >= cpi->common.mi_cols) continue;
+
+      intra_cost += this_stats->intra_cost;
+      mc_dep_cost += this_stats->mc_dep_cost;
+
+      ++count;
+    }
+  }
+
+  rk = (double)intra_cost / (intra_cost + mc_dep_cost);
+  beta = r0 / rk;
+  dr = vp9_get_adaptive_rdmult(cpi, beta);
+
+  dr = VPXMIN(dr, orig_rdmult * 5 / 4);
+  dr = VPXMAX(dr, orig_rdmult * 3 / 4);
+
+  dr = VPXMAX(1, dr);
+  return dr;
+}
+
 // TODO(jingning,jimbankoski,rbultje): properly skip partition types that are
 // unlikely to be selected depending on previous rate-distortion optimization
 // results, for encoding speed-up.
@@ -3362,15 +3702,18 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
 
   int64_t dist_breakout_thr = cpi->sf.partition_search_breakout_thr.dist;
   int rate_breakout_thr = cpi->sf.partition_search_breakout_thr.rate;
+  int must_split = 0;
+
+  int partition_mul = cpi->sf.enable_tpl_model ? x->cb_rdmult : cpi->rd.RDMULT;
 
   (void)*tp_orig;
 
   assert(num_8x8_blocks_wide_lookup[bsize] ==
          num_8x8_blocks_high_lookup[bsize]);
 
-  // Adjust dist breakout threshold according to the partition size.
   dist_breakout_thr >>=
       8 - (b_width_log2_lookup[bsize] + b_height_log2_lookup[bsize]);
+
   rate_breakout_thr *= num_pels_log2_lookup[bsize];
 
   vp9_rd_cost_init(&this_rdc);
@@ -3394,10 +3737,18 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
       set_partition_range(cm, xd, mi_row, mi_col, bsize, &min_size, &max_size);
   }
 
+  // Get sub block energy range
+  if (bsize >= BLOCK_16X16) {
+    int min_energy, max_energy;
+    vp9_get_sub_block_energy(cpi, x, mi_row, mi_col, bsize, &min_energy,
+                             &max_energy);
+    must_split = (min_energy < -3) && (max_energy - min_energy > 2);
+  }
+
   // Determine partition types in search according to the speed features.
   // The threshold set here has to be of square block size.
   if (cpi->sf.auto_min_max_partition_size) {
-    partition_none_allowed &= (bsize <= max_size && bsize >= min_size);
+    partition_none_allowed &= (bsize <= max_size);
     partition_horz_allowed &=
         ((bsize <= max_size && bsize > min_size) || force_horz_split);
     partition_vert_allowed &=
@@ -3485,9 +3836,9 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
                      best_rdc.rdcost);
     if (this_rdc.rate != INT_MAX) {
       if (bsize >= BLOCK_8X8) {
+        this_rdc.rdcost += RDCOST(partition_mul, x->rddiv,
+                                  cpi->partition_cost[pl][PARTITION_NONE], 0);
         this_rdc.rate += cpi->partition_cost[pl][PARTITION_NONE];
-        this_rdc.rdcost =
-            RDCOST(x->rdmult, x->rddiv, this_rdc.rate, this_rdc.dist);
       }
 
       if (this_rdc.rdcost < best_rdc.rdcost) {
@@ -3496,18 +3847,7 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
         best_rdc = this_rdc;
         if (bsize >= BLOCK_8X8) pc_tree->partitioning = PARTITION_NONE;
 
-        if (!cpi->sf.ml_partition_search_early_termination) {
-          // If all y, u, v transform blocks in this partition are skippable,
-          // and the dist & rate are within the thresholds, the partition search
-          // is terminated for current branch of the partition search tree.
-          if (!x->e_mbd.lossless && ctx->skippable &&
-              ((best_rdc.dist < (dist_breakout_thr >> 2)) ||
-               (best_rdc.dist < dist_breakout_thr &&
-                best_rdc.rate < rate_breakout_thr))) {
-            do_split = 0;
-            do_rect = 0;
-          }
-        } else {
+        if (cpi->sf.ml_partition_search_early_termination) {
           // Currently, the machine-learning based partition search early
           // termination is only used while bsize is 16x16, 32x32 or 64x64,
           // VPXMIN(cm->width, cm->height) >= 480, and speed = 0.
@@ -3517,6 +3857,31 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
             if (ml_pruning_partition(cm, xd, ctx, mi_row, mi_col, bsize)) {
               do_split = 0;
               do_rect = 0;
+            }
+          }
+        }
+
+        if ((do_split || do_rect) && !x->e_mbd.lossless && ctx->skippable) {
+          int use_ml_based_breakout =
+              cpi->sf.use_ml_partition_search_breakout &&
+              cm->base_qindex >= 100;
+#if CONFIG_VP9_HIGHBITDEPTH
+          if (x->e_mbd.cur_buf->flags & YV12_FLAG_HIGHBITDEPTH)
+            use_ml_based_breakout = 0;
+#endif  // CONFIG_VP9_HIGHBITDEPTH
+          if (use_ml_based_breakout) {
+            if (ml_predict_breakout(cpi, bsize, x, &this_rdc)) {
+              do_split = 0;
+              do_rect = 0;
+            }
+          } else {
+            if (!cpi->sf.ml_partition_search_early_termination) {
+              if ((best_rdc.dist < (dist_breakout_thr >> 2)) ||
+                  (best_rdc.dist < dist_breakout_thr &&
+                   best_rdc.rate < rate_breakout_thr)) {
+                do_split = 0;
+                do_rect = 0;
+              }
             }
           }
         }
@@ -3586,7 +3951,7 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
   // PARTITION_SPLIT
   // TODO(jingning): use the motion vectors given by the above search as
   // the starting point of motion search in the following partition type check.
-  if (do_split) {
+  if (do_split || must_split) {
     subsize = get_subsize(bsize, PARTITION_SPLIT);
     if (bsize == BLOCK_8X8) {
       i = 4;
@@ -3597,7 +3962,8 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
 
       if (sum_rdc.rate == INT_MAX) sum_rdc.rdcost = INT64_MAX;
     } else {
-      for (i = 0; i < 4 && sum_rdc.rdcost < best_rdc.rdcost; ++i) {
+      for (i = 0; (i < 4) && ((sum_rdc.rdcost < best_rdc.rdcost) || must_split);
+           ++i) {
         const int x_idx = (i & 1) * mi_step;
         const int y_idx = (i >> 1) * mi_step;
 
@@ -3609,6 +3975,13 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
         pc_tree->split[i]->index = i;
         rd_pick_partition(cpi, td, tile_data, tp, mi_row + y_idx,
                           mi_col + x_idx, subsize, &this_rdc,
+                          // A must split test here increases the number of sub
+                          // partitions but hurts metrics results quite a bit,
+                          // so this extra test is commented out pending
+                          // further tests on whether it adds much in terms of
+                          // visual quality.
+                          // (must_split) ? best_rdc.rdcost
+                          //              : best_rdc.rdcost - sum_rdc.rdcost,
                           best_rdc.rdcost - sum_rdc.rdcost, pc_tree->split[i]);
 
         if (this_rdc.rate == INT_MAX) {
@@ -3622,11 +3995,13 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
       }
     }
 
-    if (sum_rdc.rdcost < best_rdc.rdcost && i == 4) {
+    if (((sum_rdc.rdcost < best_rdc.rdcost) || must_split) && i == 4) {
+      sum_rdc.rdcost += RDCOST(partition_mul, x->rddiv,
+                               cpi->partition_cost[pl][PARTITION_SPLIT], 0);
       sum_rdc.rate += cpi->partition_cost[pl][PARTITION_SPLIT];
-      sum_rdc.rdcost = RDCOST(x->rdmult, x->rddiv, sum_rdc.rate, sum_rdc.dist);
 
-      if (sum_rdc.rdcost < best_rdc.rdcost) {
+      if ((sum_rdc.rdcost < best_rdc.rdcost) ||
+          (must_split && (sum_rdc.dist < best_rdc.dist))) {
         best_rdc = sum_rdc;
         pc_tree->partitioning = PARTITION_SPLIT;
 
@@ -3684,8 +4059,9 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
     }
 
     if (sum_rdc.rdcost < best_rdc.rdcost) {
+      sum_rdc.rdcost += RDCOST(partition_mul, x->rddiv,
+                               cpi->partition_cost[pl][PARTITION_HORZ], 0);
       sum_rdc.rate += cpi->partition_cost[pl][PARTITION_HORZ];
-      sum_rdc.rdcost = RDCOST(x->rdmult, x->rddiv, sum_rdc.rate, sum_rdc.dist);
       if (sum_rdc.rdcost < best_rdc.rdcost) {
         best_rdc = sum_rdc;
         pc_tree->partitioning = PARTITION_HORZ;
@@ -3732,8 +4108,9 @@ static void rd_pick_partition(VP9_COMP *cpi, ThreadData *td,
     }
 
     if (sum_rdc.rdcost < best_rdc.rdcost) {
+      sum_rdc.rdcost += RDCOST(partition_mul, x->rddiv,
+                               cpi->partition_cost[pl][PARTITION_VERT], 0);
       sum_rdc.rate += cpi->partition_cost[pl][PARTITION_VERT];
-      sum_rdc.rdcost = RDCOST(x->rdmult, x->rddiv, sum_rdc.rate, sum_rdc.dist);
       if (sum_rdc.rdcost < best_rdc.rdcost) {
         best_rdc = sum_rdc;
         pc_tree->partitioning = PARTITION_VERT;
@@ -3843,6 +4220,14 @@ static void encode_rd_sb_row(VP9_COMP *cpi, ThreadData *td,
       rd_use_partition(cpi, td, tile_data, mi, tp, mi_row, mi_col, BLOCK_64X64,
                        &dummy_rate, &dummy_dist, 1, td->pc_root);
     } else {
+      int orig_rdmult = cpi->rd.RDMULT;
+      x->cb_rdmult = orig_rdmult;
+      if (cpi->twopass.gf_group.index > 0 && cpi->sf.enable_tpl_model) {
+        int dr =
+            get_rdmult_delta(cpi, BLOCK_64X64, mi_row, mi_col, orig_rdmult);
+        x->cb_rdmult = dr;
+      }
+
       // If required set upper and lower partition size limits
       if (sf->auto_min_max_partition_size) {
         set_offsets(cpi, tile_info, x, mi_row, mi_col, BLOCK_64X64);
@@ -4618,6 +5003,7 @@ static void encode_nonrd_sb_row(VP9_COMP *cpi, ThreadData *td,
     x->skip_low_source_sad = 0;
     x->lowvar_highsumdiff = 0;
     x->content_state_sb = 0;
+    x->zero_temp_sad_source = 0;
     x->sb_use_mv_part = 0;
     x->sb_mvcol_part = 0;
     x->sb_mvrow_part = 0;
@@ -5052,6 +5438,24 @@ static void encode_frame_internal(VP9_COMP *cpi) {
 
     if (sf->partition_search_type == SOURCE_VAR_BASED_PARTITION)
       source_var_based_partition_search_method(cpi);
+  } else if (cpi->twopass.gf_group.index && cpi->sf.enable_tpl_model) {
+    TplDepFrame *tpl_frame = &cpi->tpl_stats[cpi->twopass.gf_group.index];
+    TplDepStats *tpl_stats = tpl_frame->tpl_stats_ptr;
+
+    int tpl_stride = tpl_frame->stride;
+    int64_t intra_cost_base = 0;
+    int64_t mc_dep_cost_base = 0;
+    int row, col;
+
+    for (row = 0; row < cm->mi_rows; ++row) {
+      for (col = 0; col < cm->mi_cols; ++col) {
+        TplDepStats *this_stats = &tpl_stats[row * tpl_stride + col];
+        intra_cost_base += this_stats->intra_cost;
+        mc_dep_cost_base += this_stats->mc_dep_cost;
+      }
+    }
+
+    cpi->rd.r0 = (double)intra_cost_base / (intra_cost_base + mc_dep_cost_base);
   }
 
   {

@@ -414,9 +414,12 @@ static int check_buffer_above_thresh(VP9_COMP *cpi, int drop_mark) {
                                          svc->number_temporal_layers);
       LAYER_CONTEXT *lc = &svc->layer_context[layer];
       RATE_CONTROL *lrc = &lc->rc;
-      const int drop_mark_layer =
-          (int)(cpi->svc.framedrop_thresh[i] * lrc->optimal_buffer_level / 100);
-      if (!(lrc->buffer_level > drop_mark_layer)) return 0;
+      // Exclude check for layer whose bitrate is 0.
+      if (lc->target_bandwidth > 0) {
+        const int drop_mark_layer = (int)(cpi->svc.framedrop_thresh[i] *
+                                          lrc->optimal_buffer_level / 100);
+        if (!(lrc->buffer_level > drop_mark_layer)) return 0;
+      }
     }
     return 1;
   }
@@ -439,12 +442,15 @@ static int check_buffer_below_thresh(VP9_COMP *cpi, int drop_mark) {
                                          svc->number_temporal_layers);
       LAYER_CONTEXT *lc = &svc->layer_context[layer];
       RATE_CONTROL *lrc = &lc->rc;
-      const int drop_mark_layer =
-          (int)(cpi->svc.framedrop_thresh[i] * lrc->optimal_buffer_level / 100);
-      if (cpi->svc.framedrop_mode == FULL_SUPERFRAME_DROP) {
-        if (lrc->buffer_level <= drop_mark_layer) return 1;
-      } else {
-        if (!(lrc->buffer_level <= drop_mark_layer)) return 0;
+      // Exclude check for layer whose bitrate is 0.
+      if (lc->target_bandwidth > 0) {
+        const int drop_mark_layer = (int)(cpi->svc.framedrop_thresh[i] *
+                                          lrc->optimal_buffer_level / 100);
+        if (cpi->svc.framedrop_mode == FULL_SUPERFRAME_DROP) {
+          if (lrc->buffer_level <= drop_mark_layer) return 1;
+        } else {
+          if (!(lrc->buffer_level <= drop_mark_layer)) return 0;
+        }
       }
     }
     if (cpi->svc.framedrop_mode == FULL_SUPERFRAME_DROP)
@@ -1511,6 +1517,7 @@ void vp9_rc_postencode_update(VP9_COMP *cpi, uint64_t bytes_used) {
   const VP9_COMMON *const cm = &cpi->common;
   const VP9EncoderConfig *const oxcf = &cpi->oxcf;
   RATE_CONTROL *const rc = &cpi->rc;
+  SVC *const svc = &cpi->svc;
   const int qindex = cm->base_qindex;
 
   // Update rate control heuristics
@@ -1599,10 +1606,9 @@ void vp9_rc_postencode_update(VP9_COMP *cpi, uint64_t bytes_used) {
 
   // If second (long term) temporal reference is used for SVC,
   // update the golden frame counter, only for base temporal layer.
-  if (cpi->use_svc && cpi->svc.use_gf_temporal_ref_current_layer &&
-      cpi->svc.temporal_layer_id == 0) {
+  if (cpi->use_svc && svc->use_gf_temporal_ref_current_layer &&
+      svc->temporal_layer_id == 0) {
     int i = 0;
-    SVC *const svc = &cpi->svc;
     if (cpi->refresh_golden_frame)
       rc->frames_since_golden = 0;
     else
@@ -1636,19 +1642,31 @@ void vp9_rc_postencode_update(VP9_COMP *cpi, uint64_t bytes_used) {
     if (cm->frame_type != KEY_FRAME &&
         (!cpi->use_svc ||
          (cpi->use_svc &&
-          !cpi->svc.layer_context[cpi->svc.temporal_layer_id].is_key_frame &&
-          cpi->svc.spatial_layer_id == cpi->svc.number_spatial_layers - 1))) {
+          !svc->layer_context[svc->temporal_layer_id].is_key_frame &&
+          svc->spatial_layer_id == svc->number_spatial_layers - 1))) {
       compute_frame_low_motion(cpi);
       if (cpi->sf.use_altref_onepass) update_altref_usage(cpi);
+    }
+    // For SVC: set avg_frame_low_motion (only computed on top spatial layer)
+    // to all lower spatial layers.
+    if (cpi->use_svc &&
+        svc->spatial_layer_id == svc->number_spatial_layers - 1) {
+      int i;
+      for (i = 0; i < svc->number_spatial_layers - 1; ++i) {
+        const int layer = LAYER_IDS_TO_IDX(i, svc->temporal_layer_id,
+                                           svc->number_temporal_layers);
+        LAYER_CONTEXT *const lc = &svc->layer_context[layer];
+        RATE_CONTROL *const lrc = &lc->rc;
+        lrc->avg_frame_low_motion = rc->avg_frame_low_motion;
+      }
     }
     cpi->rc.last_frame_is_src_altref = cpi->rc.is_src_frame_alt_ref;
   }
   if (cm->frame_type != KEY_FRAME) rc->reset_high_source_sad = 0;
 
   rc->last_avg_frame_bandwidth = rc->avg_frame_bandwidth;
-  if (cpi->use_svc &&
-      cpi->svc.spatial_layer_id < cpi->svc.number_spatial_layers - 1)
-    cpi->svc.lower_layer_qindex = cm->base_qindex;
+  if (cpi->use_svc && svc->spatial_layer_id < svc->number_spatial_layers - 1)
+    svc->lower_layer_qindex = cm->base_qindex;
 }
 
 void vp9_rc_postencode_update_drop_frame(VP9_COMP *cpi) {
@@ -1853,10 +1871,14 @@ void vp9_rc_get_svc_params(VP9_COMP *cpi) {
                                svc->number_temporal_layers);
   // Periodic key frames is based on the super-frame counter
   // (svc.current_superframe), also only base spatial layer is key frame.
+  // Key frame is set for any of the following: very first frame, frame flags
+  // indicates key, superframe counter hits key frequencey, or sync flag is
+  // set for spatial layer 0.
   if ((cm->current_video_frame == 0) || (cpi->frame_flags & FRAMEFLAGS_KEY) ||
       (cpi->oxcf.auto_key &&
        (svc->current_superframe % cpi->oxcf.key_freq == 0) &&
-       svc->spatial_layer_id == 0)) {
+       svc->spatial_layer_id == 0) ||
+      (svc->spatial_layer_sync[0] == 1 && svc->spatial_layer_id == 0)) {
     cm->frame_type = KEY_FRAME;
     rc->source_alt_ref_active = 0;
     if (is_one_pass_cbr_svc(cpi)) {
@@ -1880,6 +1902,10 @@ void vp9_rc_get_svc_params(VP9_COMP *cpi) {
       target = calc_pframe_target_size_one_pass_cbr(cpi);
     }
   }
+
+  // Check if superframe contains a sync layer request.
+  vp9_svc_check_spatial_layer_sync(cpi);
+
   // If long term termporal feature is enabled, set the period of the update.
   // The update/refresh of this reference frame is always on base temporal
   // layer frame.

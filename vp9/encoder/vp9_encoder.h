@@ -283,6 +283,10 @@ typedef struct TplDepStats {
   uint64_t inter_cost;
   uint64_t mc_flow;
   uint64_t mc_dep_cost;
+  uint64_t mc_ref_cost;
+
+  int ref_frame_index;
+  int_mv mv;
 } TplDepStats;
 
 typedef struct TplDepFrame {
@@ -291,7 +295,11 @@ typedef struct TplDepFrame {
   int stride;
   int width;
   int height;
+  int mi_rows;
+  int mi_cols;
 } TplDepFrame;
+
+#define TPL_DEP_COST_SCALE_LOG2 4
 
 // TODO(jingning) All spatially adaptive variables should go to TileDataEnc.
 typedef struct TileDataEnc {
@@ -506,6 +514,8 @@ typedef struct VP9_COMP {
 
   int refresh_last_frame;
   int refresh_golden_frame;
+  int refresh_bwd_ref_frame;
+  int refresh_alt2_ref_frame;
   int refresh_alt_ref_frame;
 
   int ext_refresh_frame_flags_pending;
@@ -745,6 +755,12 @@ typedef struct VP9_COMP {
 
   uint8_t *count_arf_frame_usage;
   uint8_t *count_lastgolden_frame_usage;
+
+  // Parameters on multi-layer ALTREFs
+  int num_extra_arfs;
+  int arf_pos_in_gf[MAX_EXT_ARFS + 1];
+  int arf_pos_for_ovrly[MAX_EXT_ARFS + 1];
+  int extra_arf_allowed;
 
   vpx_roi_map_t roi;
 } VP9_COMP;
