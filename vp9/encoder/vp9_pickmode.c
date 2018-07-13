@@ -1518,6 +1518,10 @@ void vp9_pick_inter_mode(VP9_COMP *cpi, MACROBLOCK *x, TileDataEnc *tile_data,
   int svc_mv_row = 0;
   int no_scaling = 0;
   unsigned int thresh_svc_skip_golden = 500;
+  int scene_change_detected =
+      cpi->rc.high_source_sad ||
+      (cpi->use_svc && cpi->svc.high_source_sad_superframe);
+  x->source_variance = UINT_MAX;
   if (cpi->sf.default_interp_filter == BILINEAR) {
     best_pred_filter = BILINEAR;
     filter_gf_svc = BILINEAR;
@@ -1780,6 +1784,11 @@ void vp9_pick_inter_mode(VP9_COMP *cpi, MACROBLOCK *x, TileDataEnc *tile_data,
 
     if (ref_frame > usable_ref_frame) continue;
     if (skip_ref_find_pred[ref_frame]) continue;
+
+    if (svc->previous_frame_is_intra_only) {
+      if (ref_frame != LAST_FRAME || frame_mv[this_mode][ref_frame].as_int != 0)
+        continue;
+    }
 
     // If the segment reference frame feature is enabled then do nothing if the
     // current ref frame is not allowed.
@@ -2308,8 +2317,9 @@ void vp9_pick_inter_mode(VP9_COMP *cpi, MACROBLOCK *x, TileDataEnc *tile_data,
          svc_force_zero_mode[best_ref_frame - 1]);
     inter_mode_thresh = (inter_mode_thresh << 1) + inter_mode_thresh;
   }
-  if (cpi->oxcf.lag_in_frames > 0 && cpi->oxcf.rc_mode == VPX_VBR &&
-      cpi->rc.is_src_frame_alt_ref)
+  if ((cpi->oxcf.lag_in_frames > 0 && cpi->oxcf.rc_mode == VPX_VBR &&
+       cpi->rc.is_src_frame_alt_ref) ||
+      svc->previous_frame_is_intra_only)
     perform_intra_pred = 0;
 
   // If the segment reference frame feature is enabled and set then
@@ -2321,6 +2331,7 @@ void vp9_pick_inter_mode(VP9_COMP *cpi, MACROBLOCK *x, TileDataEnc *tile_data,
   // Perform intra prediction search, if the best SAD is above a certain
   // threshold.
   if (best_rdc.rdcost == INT64_MAX ||
+      (scene_change_detected && perform_intra_pred) ||
       ((!force_skip_low_temp_var || bsize < BLOCK_32X32 ||
         x->content_state_sb == kVeryHighSad) &&
        perform_intra_pred && !x->skip && best_rdc.rdcost > inter_mode_thresh &&

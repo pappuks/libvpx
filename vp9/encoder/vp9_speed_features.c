@@ -733,6 +733,10 @@ static void set_rt_speed_feature_framesize_independent(
           (uint8_t *)vpx_calloc((cm->mi_stride >> 3) * ((cm->mi_rows >> 3) + 1),
                                 sizeof(*cpi->count_lastgolden_frame_usage));
   }
+  if (cpi->svc.previous_frame_is_intra_only) {
+    sf->partition_search_type = FIXED_PARTITION;
+    sf->always_this_block_size = BLOCK_64X64;
+  }
 }
 
 void vp9_set_speed_features_framesize_dependent(VP9_COMP *cpi) {
@@ -839,7 +843,11 @@ void vp9_set_speed_features_framesize_independent(VP9_COMP *cpi) {
   sf->allow_quant_coeff_opt = sf->optimize_coefficients;
   sf->quant_opt_thresh = 99.0;
   sf->allow_acl = 1;
+#if CONFIG_VP9_HIGHBITDEPTH
   sf->enable_tpl_model = 0;
+#else
+  sf->enable_tpl_model = 1;
+#endif
 
   for (i = 0; i < TX_SIZES; i++) {
     sf->intra_y_mode_mask[i] = INTRA_ALL;
